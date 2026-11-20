@@ -22,7 +22,7 @@ let package = Package(
             name: "SamsungSwitchCore",
             path: "Sources",
             exclude: ["App"],
-            sources: ["Protocol", "BLE"]
+            sources: ["Protocol", "BLE", "Audio", "Bluetooth", "Media", "StateMachine"]
         ),
         .executableTarget(
             name: "SamsungSwitch",

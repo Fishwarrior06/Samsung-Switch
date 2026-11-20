@@ -6,22 +6,34 @@ import SamsungSwitchCore
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let logger = Logger(subsystem: "com.samsungswitch.macos", category: "App")
-    private let bleServer: BLETransport = BLEGattServer()
+    private let bleServer = BLEGattServer()
+    private let audioMonitor = CoreAudioMonitor()
+    private lazy var budsController = IOBluetoothBudsController(audioMonitor: audioMonitor)
+    private let mediaPauser = MacMediaPauser()
+    private lazy var stateMachine = HandoffStateMachine(
+        bleTransport: bleServer,
+        budsController: budsController,
+        mediaPauser: mediaPauser
+    )
 
     private var statusItem: NSStatusItem?
     private let statusMenuItem = NSMenuItem(title: "BLE: Starting...", action: nil, keyEquivalent: "")
+    private let ownershipMenuItem = NSMenuItem(title: "State: idle", action: nil, keyEquivalent: "")
+    private let audioMenuItem = NSMenuItem(title: "Output: —", action: nil, keyEquivalent: "")
     private let lastRxMenuItem = NSMenuItem(title: "Last RX: —", action: nil, keyEquivalent: "")
     private let lastTxMenuItem = NSMenuItem(title: "Last TX: —", action: nil, keyEquivalent: "")
+    private var autoSwitchMenuItem: NSMenuItem?
+    private var accessibilityMenuItem: NSMenuItem?
 
-    private var sequenceNumber: UInt16 = 0
     private var sleepObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItem()
         setupSleepWakeObservers()
-        setupBLECallbacks()
+        wireComponents()
         bleServer.start()
+        audioMonitor.start()
         logger.info("Samsung Switch macOS menu-bar service launched")
     }
 
@@ -33,6 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let wakeObserver {
             workspaceCenter.removeObserver(wakeObserver)
         }
+        audioMonitor.stop()
         bleServer.stop()
     }
 
@@ -48,50 +61,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if symbol == nil {
                 button.title = "SSw"
             }
-            button.toolTip = "Samsung Switch BLE Link"
+            button.toolTip = "Samsung Switch"
         }
 
         let menu = NSMenu()
-        statusMenuItem.isEnabled = false
-        lastRxMenuItem.isEnabled = false
-        lastTxMenuItem.isEnabled = false
-
-        menu.addItem(statusMenuItem)
-        menu.addItem(lastRxMenuItem)
-        menu.addItem(lastTxMenuItem)
+        [statusMenuItem, ownershipMenuItem, audioMenuItem, lastRxMenuItem, lastTxMenuItem].forEach {
+            $0.isEnabled = false
+            menu.addItem($0)
+        }
         menu.addItem(.separator())
 
-        let sendSyncItem = NSMenuItem(
-            title: "Send STATE_SYNC (Phase 1 Test)",
-            action: #selector(sendStateSyncAction),
+        let autoItem = NSMenuItem(
+            title: "Auto-Switch Enabled",
+            action: #selector(toggleAutoSwitchAction),
             keyEquivalent: ""
         )
-        sendSyncItem.target = self
-        menu.addItem(sendSyncItem)
+        autoItem.target = self
+        autoItem.state = .on
+        menu.addItem(autoItem)
+        autoSwitchMenuItem = autoItem
 
-        let sendHeartbeatItem = NSMenuItem(
-            title: "Send HEARTBEAT_ACK (Phase 1 Test)",
-            action: #selector(sendHeartbeatAckAction),
-            keyEquivalent: ""
+        let pullItem = NSMenuItem(
+            title: "Pull Buds Here",
+            action: #selector(pullBudsAction),
+            keyEquivalent: "p"
         )
-        sendHeartbeatItem.target = self
-        menu.addItem(sendHeartbeatItem)
+        pullItem.target = self
+        menu.addItem(pullItem)
 
-        let sendClaimItem = NSMenuItem(
-            title: "Send CLAIM (MANUAL)",
-            action: #selector(sendManualClaimAction),
+        let releaseItem = NSMenuItem(
+            title: "Release Buds to Phone",
+            action: #selector(releaseBudsAction),
             keyEquivalent: ""
         )
-        sendClaimItem.target = self
-        menu.addItem(sendClaimItem)
+        releaseItem.target = self
+        menu.addItem(releaseItem)
 
-        let sendReleasedItem = NSMenuItem(
-            title: "Send RELEASED",
-            action: #selector(sendReleasedAction),
+        let accessibilityTitle = mediaPauser.isAccessibilityAuthorized
+            ? "Mac Auto-Pause: Authorized"
+            : "Enable Mac Auto-Pause (Accessibility)..."
+        let accessibilityItem = NSMenuItem(
+            title: accessibilityTitle,
+            action: #selector(requestAccessibilityAction),
             keyEquivalent: ""
         )
-        sendReleasedItem.target = self
-        menu.addItem(sendReleasedItem)
+        accessibilityItem.target = self
+        accessibilityItem.isEnabled = !mediaPauser.isAccessibilityAuthorized
+        menu.addItem(accessibilityItem)
+        accessibilityMenuItem = accessibilityItem
 
         menu.addItem(.separator())
 
@@ -123,6 +140,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
+                self?.stateMachine.handleMacWillSleep()
                 self?.bleServer.pauseForSleep()
             }
         }
@@ -137,63 +155,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func setupBLECallbacks() {
+    private func wireComponents() {
         bleServer.onStatusChanged = { [weak self] status in
             self?.statusMenuItem.title = "BLE: \(status.displayText)"
         }
         bleServer.onFrameReceived = { [weak self] frame in
             guard let self else { return }
             self.lastRxMenuItem.title = "Last RX: \(frame.summary)"
-            self.handleIncomingFrame(frame)
+            self.stateMachine.handleRemoteFrame(frame)
         }
+        audioMonitor.onRunningChanged = { [weak self] isPlaying in
+            self?.stateMachine.handleLocalAudioChanged(isPlaying: isPlaying)
+        }
+        audioMonitor.onOutputDeviceChanged = { [weak self] deviceName in
+            self?.audioMenuItem.title = "Output: \(deviceName)"
+        }
+        stateMachine.onStateChanged = { [weak self] in
+            guard let self else { return }
+            let callSuffix = self.stateMachine.isPhoneInCall ? " [CALL LOCK]" : ""
+            self.ownershipMenuItem.title = "State: \(self.stateMachine.ownership.rawValue)\(callSuffix)"
+        }
+        stateMachine.onFrameTransmitted = { [weak self] frame in
+            self?.lastTxMenuItem.title = "Last TX: \(frame.summary)"
+        }
+
         statusMenuItem.title = "BLE: \(bleServer.status.displayText)"
+        audioMenuItem.title = "Output: \(audioMonitor.defaultOutputDeviceName)"
     }
 
-    private func handleIncomingFrame(_ frame: HandoffFrame) {
-        // Phase 1 bidirectional verification: acknowledge incoming frames except HEARTBEAT_ACK itself
-        // to avoid echo loops.
-        guard frame.opcode != .heartbeatAck else { return }
-        let ack = HandoffFrame(
-            opcode: .heartbeatAck,
-            reason: frame.reason,
-            state: .idle,
-            seq: frame.seq
-        )
-        if bleServer.sendFrame(ack) {
-            lastTxMenuItem.title = "Last TX: \(ack.summary)"
-        }
+    @objc private func toggleAutoSwitchAction() {
+        let next = !stateMachine.isAutoSwitchEnabled
+        stateMachine.setAutoSwitchEnabled(next)
+        autoSwitchMenuItem?.state = next ? .on : .off
     }
 
-    private func nextSequence() -> UInt16 {
-        sequenceNumber &+= 1
-        return sequenceNumber
+    @objc private func pullBudsAction() {
+        stateMachine.handleManualPull()
     }
 
-    private func transmitFrame(opcode: HandoffOpcode, reason: HandoffReason, state: PeerState) {
-        let frame = HandoffFrame(
-            opcode: opcode,
-            reason: reason,
-            state: state,
-            seq: nextSequence()
-        )
-        _ = bleServer.sendFrame(frame)
-        lastTxMenuItem.title = "Last TX: \(frame.summary)"
+    @objc private func releaseBudsAction() {
+        stateMachine.handleManualRelease()
     }
 
-    @objc private func sendStateSyncAction() {
-        transmitFrame(opcode: .stateSync, reason: .none, state: .idle)
-    }
-
-    @objc private func sendHeartbeatAckAction() {
-        transmitFrame(opcode: .heartbeatAck, reason: .manual, state: .idle)
-    }
-
-    @objc private func sendManualClaimAction() {
-        transmitFrame(opcode: .claim, reason: .manual, state: .playing)
-    }
-
-    @objc private func sendReleasedAction() {
-        transmitFrame(opcode: .released, reason: .none, state: .idle)
+    @objc private func requestAccessibilityAction() {
+        mediaPauser.requestAccessibilityOptIn()
+        let authorized = mediaPauser.isAccessibilityAuthorized
+        accessibilityMenuItem?.title = authorized
+            ? "Mac Auto-Pause: Authorized"
+            : "Enable Mac Auto-Pause (Accessibility)..."
+        accessibilityMenuItem?.isEnabled = !authorized
     }
 
     @objc private func restartAdvertisingAction() {

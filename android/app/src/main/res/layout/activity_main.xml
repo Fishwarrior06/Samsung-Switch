@@ -28,6 +28,20 @@
             android:id="@+id/textMacStatus"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:paddingBottom="4dp"
+            android:textSize="14sp" />
+
+        <TextView
+            android:id="@+id/textShizukuStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingBottom="4dp"
+            android:textSize="14sp" />
+
+        <TextView
+            android:id="@+id/textOwnership"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
             android:paddingBottom="8dp"
             android:textSize="14sp" />
 
@@ -57,6 +71,20 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
             android:text="@string/btn_connect" />
+
+        <Button
+            android:id="@+id/btnGrantShizuku"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/btn_grant_shizuku" />
+
+        <Button
+            android:id="@+id/btnConnectBuds"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/btn_connect_buds" />
 
         <Button
             android:id="@+id/btnSendSync"

@@ -3,6 +3,9 @@ package com.samsungswitch.ble
 import android.content.Context
 import android.content.SharedPreferences
 import androidx.core.content.edit
+import com.samsungswitch.audio.AndroidAudioMonitor
+import com.samsungswitch.bluetooth.ShizukuA2dpConnector
+import com.samsungswitch.state.AndroidHandoffCoordinator
 import java.util.Locale
 
 object BleLinkManager {
@@ -14,6 +17,11 @@ object BleLinkManager {
 
     private lateinit var appContext: Context
     private lateinit var gattClient: BleGattClient
+    private lateinit var audioMonitor: AndroidAudioMonitor
+    lateinit var budsConnector: ShizukuA2dpConnector
+        private set
+    lateinit var handoffCoordinator: AndroidHandoffCoordinator
+        private set
 
     val coordinator: BleLinkCoordinator = BleLinkCoordinator { gattClient }
 
@@ -24,6 +32,37 @@ object BleLinkManager {
             appContext = context.applicationContext
             AppLogger.init(appContext)
             gattClient = BleGattClient(appContext, coordinator)
+            audioMonitor = AndroidAudioMonitor(appContext)
+            budsConnector = ShizukuA2dpConnector(appContext)
+            handoffCoordinator = AndroidHandoffCoordinator(
+                bleCoordinator = coordinator,
+                budsConnector = budsConnector,
+                pauseLocalMedia = { audioMonitor.pauseLocalMedia() }
+            )
+
+            coordinator.onRemoteFrameListener = { frame ->
+                handoffCoordinator.onRemoteFrame(frame)
+            }
+            coordinator.onLinkStateChangedListener = { state ->
+                when (state) {
+                    is BleLinkState.ConnectedLowPower -> {
+                        audioMonitor.start(
+                            onMediaPlayingChanged = { playing ->
+                                handoffCoordinator.onLocalMediaPlayingChanged(playing)
+                            },
+                            onCallActiveChanged = { inCall ->
+                                handoffCoordinator.onCallActiveChanged(inCall)
+                            }
+                        )
+                    }
+                    is BleLinkState.Disconnected,
+                    is BleLinkState.Error -> {
+                        audioMonitor.stop()
+                    }
+                    else -> Unit
+                }
+            }
+
             coordinator.setAssociatedMacPresent(getAssociatedAddress() != null)
             initialized = true
         }
@@ -54,6 +93,7 @@ object BleLinkManager {
     }
 
     fun disconnect() {
+        audioMonitor.stop()
         gattClient.disconnect()
     }
 }

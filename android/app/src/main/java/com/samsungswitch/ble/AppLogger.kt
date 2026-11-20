@@ -16,23 +16,31 @@ object AppLogger {
 
     fun d(category: String, message: String) {
         if (debugEnabled) {
-            Log.d(TAG, "[$category] $message")
+            safeLog { Log.d(TAG, "[$category] $message") }
         }
     }
 
     fun i(category: String, message: String) {
-        Log.i(TAG, "[$category] $message")
+        safeLog { Log.i(TAG, "[$category] $message") }
     }
 
     fun w(category: String, message: String) {
-        Log.w(TAG, "[$category] $message")
+        safeLog { Log.w(TAG, "[$category] $message") }
     }
 
     fun e(category: String, message: String, throwable: Throwable? = null) {
         if (throwable != null && debugEnabled) {
-            Log.e(TAG, "[$category] $message", throwable)
+            safeLog { Log.e(TAG, "[$category] $message", throwable) }
         } else {
-            Log.e(TAG, "[$category] $message")
+            safeLog { Log.e(TAG, "[$category] $message") }
+        }
+    }
+
+    private inline fun safeLog(block: () -> Unit) {
+        try {
+            block()
+        } catch (_: RuntimeException) {
+            // JVM unit tests do not mock android.util.Log.
         }
     }
 }

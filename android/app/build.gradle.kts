@@ -30,6 +30,10 @@ android {
         jvmTarget = "17"
     }
 
+    buildFeatures {
+        aidl = true
+    }
+
     testOptions {
         unitTests.all {
             it.useJUnitPlatform()
@@ -40,8 +44,11 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
 
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
     testImplementation("io.mockk:mockk:1.13.16")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
 }

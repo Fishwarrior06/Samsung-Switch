@@ -41,12 +41,16 @@ class BleLinkCoordinator(
     private val _associatedMacPresent = MutableStateFlow(false)
     val associatedMacPresent: StateFlow<Boolean> = _associatedMacPresent.asStateFlow()
 
+    var onRemoteFrameListener: ((HandoffFrame) -> Unit)? = null
+    var onLinkStateChangedListener: ((BleLinkState) -> Unit)? = null
+
     fun setAssociatedMacPresent(present: Boolean) {
         _associatedMacPresent.value = present
     }
 
     fun updateLinkState(state: BleLinkState) {
         _linkState.value = state
+        onLinkStateChangedListener?.invoke(state)
     }
 
     fun nextSequence(): Int {
@@ -75,7 +79,8 @@ class BleLinkCoordinator(
 
     fun onFrameReceived(frame: HandoffFrame) {
         _lastRxSummary.value = "Last RX: ${frame.summary()}"
-        if (frame.opcode != HandoffOpcode.HEARTBEAT_ACK) {
+        onRemoteFrameListener?.invoke(frame)
+        if (frame.opcode == HandoffOpcode.STATE_SYNC) {
             val ack = HandoffFrame(
                 opcode = HandoffOpcode.HEARTBEAT_ACK,
                 reason = frame.reason,

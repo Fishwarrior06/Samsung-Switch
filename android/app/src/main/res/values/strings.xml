@@ -1,14 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Samsung Switch</string>
-    <string name="header_title">Samsung Switch (Phase 1 BLE)</string>
+    <string name="header_title">Samsung Switch</string>
     <string name="btn_pair_mac">Pair Mac (CompanionDevice)</string>
     <string name="btn_connect">Connect GATT</string>
+    <string name="btn_grant_shizuku">Authorize Shizuku A2DP</string>
+    <string name="btn_connect_buds">Test Buds A2DP (Shizuku)</string>
     <string name="btn_send_sync">Send STATE_SYNC</string>
     <string name="btn_send_claim">Send CLAIM (MEDIA)</string>
     <string name="btn_send_heartbeat">Send HEARTBEAT_ACK</string>
     <string name="btn_disconnect">Disconnect</string>
     <string name="status_ble_format">BLE Status: %1$s</string>
+    <string name="status_shizuku_ready">Shizuku A2DP: Ready</string>
+    <string name="status_shizuku_needed">Shizuku A2DP: Permission / Service needed</string>
+    <string name="status_ownership_format">Ownership: %1$s</string>
     <string name="mac_status_paired">Associated Mac: Paired (Presence Offload Enabled)</string>
     <string name="mac_status_unpaired">Associated Mac: Not paired</string>
 </resources>

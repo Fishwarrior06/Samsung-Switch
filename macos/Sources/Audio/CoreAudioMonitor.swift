@@ -1,0 +1,173 @@
+import CoreAudio
+import Foundation
+import os
+
+@MainActor
+public protocol AudioMonitoring: AnyObject {
+    var isDefaultOutputRunning: Bool { get }
+    var defaultOutputDeviceName: String { get }
+    var onRunningChanged: ((Bool) -> Void)? { get set }
+    var onOutputDeviceChanged: ((String) -> Void)? { get set }
+    func start()
+    func stop()
+}
+
+@MainActor
+public final class CoreAudioMonitor: AudioMonitoring {
+    private let logger = Logger(subsystem: "com.samsungswitch.macos", category: "CoreAudioMonitor")
+
+    public private(set) var isDefaultOutputRunning: Bool = false
+    public private(set) var defaultOutputDeviceName: String = "Unknown"
+    public var onRunningChanged: ((Bool) -> Void)?
+    public var onOutputDeviceChanged: ((String) -> Void)?
+
+    private var isMonitoring = false
+    private var observedDeviceID: AudioDeviceID = AudioDeviceID(kAudioObjectUnknown)
+    private var defaultDeviceBlock: AudioObjectPropertyListenerBlock?
+    private var isRunningBlock: AudioObjectPropertyListenerBlock?
+
+    private var defaultOutputAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+
+    private var isRunningAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+
+    public init() {}
+
+    public func start() {
+        guard !isMonitoring else { return }
+        isMonitoring = true
+
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            MainActor.assumeIsolated {
+                guard let self, self.isMonitoring else { return }
+                self.refreshDefaultOutputDevice()
+            }
+        }
+        defaultDeviceBlock = block
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &defaultOutputAddress,
+            DispatchQueue.main,
+            block
+        )
+
+        refreshDefaultOutputDevice()
+        logger.info("CoreAudioMonitor started (output='\(self.defaultOutputDeviceName, privacy: .public)')")
+    }
+
+    public func stop() {
+        isMonitoring = false
+        removeDeviceRunningListener()
+        if let block = defaultDeviceBlock {
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject),
+                &defaultOutputAddress,
+                DispatchQueue.main,
+                block
+            )
+            defaultDeviceBlock = nil
+        }
+    }
+
+    public func isBudsActiveOutput(matching nameSubstrings: [String] = ["buds", "galaxy"]) -> Bool {
+        let lower = defaultOutputDeviceName.lowercased()
+        return nameSubstrings.contains { lower.contains($0.lowercased()) }
+    }
+
+    private func refreshDefaultOutputDevice() {
+        let deviceID = Self.readDefaultOutputDeviceID()
+        let name = Self.readDeviceName(deviceID)
+        if name != defaultOutputDeviceName {
+            defaultOutputDeviceName = name
+            onOutputDeviceChanged?(name)
+        }
+
+        if deviceID != observedDeviceID {
+            removeDeviceRunningListener()
+            observedDeviceID = deviceID
+            installDeviceRunningListener(for: deviceID)
+        }
+        refreshRunningState()
+    }
+
+    private func installDeviceRunningListener(for deviceID: AudioDeviceID) {
+        guard deviceID != kAudioObjectUnknown else { return }
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            MainActor.assumeIsolated {
+                guard let self, self.isMonitoring else { return }
+                self.refreshRunningState()
+            }
+        }
+        isRunningBlock = block
+        AudioObjectAddPropertyListenerBlock(deviceID, &isRunningAddress, DispatchQueue.main, block)
+    }
+
+    private func removeDeviceRunningListener() {
+        guard observedDeviceID != kAudioObjectUnknown, let block = isRunningBlock else { return }
+        AudioObjectRemovePropertyListenerBlock(observedDeviceID, &isRunningAddress, DispatchQueue.main, block)
+        isRunningBlock = nil
+    }
+
+    private func refreshRunningState() {
+        let running = Self.readIsRunningSomewhere(observedDeviceID)
+        if running != isDefaultOutputRunning {
+            isDefaultOutputRunning = running
+            logger.debug("CoreAudio running state changed: \(running)")
+            onRunningChanged?(running)
+        }
+    }
+
+    private static func readDefaultOutputDeviceID() -> AudioDeviceID {
+        var deviceID = AudioDeviceID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &addr,
+            0,
+            nil,
+            &size,
+            &deviceID
+        )
+        return status == noErr ? deviceID : AudioDeviceID(kAudioObjectUnknown)
+    }
+
+    private static func readDeviceName(_ deviceID: AudioDeviceID) -> String {
+        guard deviceID != kAudioObjectUnknown else { return "Unknown" }
+        var nameCF: CFString = "" as CFString
+        var size = UInt32(MemoryLayout<CFString>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let status = withUnsafeMutablePointer(to: &nameCF) { ptr in
+            AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, ptr)
+        }
+        return status == noErr ? (nameCF as String) : "AudioDevice(\(deviceID))"
+    }
+
+    private static func readIsRunningSomewhere(_ deviceID: AudioDeviceID) -> Bool {
+        guard deviceID != kAudioObjectUnknown else { return false }
+        var running: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let status = AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, &running)
+        return status == noErr && running != 0
+    }
+}

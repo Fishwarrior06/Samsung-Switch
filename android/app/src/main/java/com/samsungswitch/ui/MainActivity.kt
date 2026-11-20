@@ -35,6 +35,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import rikka.shizuku.Shizuku
 
 class MainActivity : Activity() {
 
@@ -42,6 +43,7 @@ class MainActivity : Activity() {
         private const val CATEGORY = "MainActivity"
         private const val REQUEST_BLUETOOTH_CONNECT = 1001
         private const val REQUEST_COMPANION_ASSOCIATE = 1002
+        private const val REQUEST_SHIZUKU_PERMISSION = 1003
     }
 
     private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -50,8 +52,18 @@ class MainActivity : Activity() {
 
     private lateinit var textStatus: TextView
     private lateinit var textMacStatus: TextView
+    private lateinit var textShizukuStatus: TextView
+    private lateinit var textOwnership: TextView
     private lateinit var textLastRx: TextView
     private lateinit var textLastTx: TextView
+
+    private val shizukuPermissionListener =
+        Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
+            if (requestCode == REQUEST_SHIZUKU_PERMISSION) {
+                AppLogger.i(CATEGORY, "Shizuku permission result: $grantResult")
+                refreshShizukuStatus()
+            }
+        }
 
     private val companionDeviceManager: CompanionDeviceManager by lazy {
         getSystemService(CompanionDeviceManager::class.java)
@@ -64,8 +76,12 @@ class MainActivity : Activity() {
 
         textStatus = findViewById(R.id.textStatus)
         textMacStatus = findViewById(R.id.textMacStatus)
+        textShizukuStatus = findViewById(R.id.textShizukuStatus)
+        textOwnership = findViewById(R.id.textOwnership)
         textLastRx = findViewById(R.id.textLastRx)
         textLastTx = findViewById(R.id.textLastTx)
+        Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
+        refreshShizukuStatus()
 
         findViewById<Button>(R.id.btnPairMac).setOnClickListener {
             if (ensureBluetoothConnectPermission()) {
@@ -79,6 +95,15 @@ class MainActivity : Activity() {
                         BleLinkState.Error("No associated Mac yet; tap Pair Mac first")
                     )
                 }
+            }
+        }
+        findViewById<Button>(R.id.btnGrantShizuku).setOnClickListener {
+            requestShizukuPermission()
+        }
+        findViewById<Button>(R.id.btnConnectBuds).setOnClickListener {
+            uiScope.launch {
+                BleLinkManager.budsConnector.connectBuds()
+                refreshShizukuStatus()
             }
         }
         findViewById<Button>(R.id.btnSendSync).setOnClickListener {
@@ -113,13 +138,40 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener)
         observerJob?.cancel()
         uiScope.cancel()
         super.onDestroy()
     }
 
+    private fun refreshShizukuStatus() {
+        textShizukuStatus.text = if (BleLinkManager.budsConnector.isReady()) {
+            getString(R.string.status_shizuku_ready)
+        } else {
+            getString(R.string.status_shizuku_needed)
+        }
+    }
+
+    private fun requestShizukuPermission() {
+        try {
+            if (!Shizuku.pingBinder()) {
+                textShizukuStatus.text = getString(R.string.status_shizuku_needed)
+                return
+            }
+            if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
+                refreshShizukuStatus()
+                return
+            }
+            Shizuku.requestPermission(REQUEST_SHIZUKU_PERMISSION)
+        } catch (e: Throwable) {
+            AppLogger.w(CATEGORY, "Shizuku service unavailable")
+            refreshShizukuStatus()
+        }
+    }
+
     private fun startObservingStateFlows() {
         val coordinator = BleLinkManager.coordinator
+        val handoff = BleLinkManager.handoffCoordinator
         observerJob = uiScope.launch {
             launch {
                 coordinator.linkState.collectLatest { state ->
@@ -133,6 +185,11 @@ class MainActivity : Activity() {
                     } else {
                         getString(R.string.mac_status_unpaired)
                     }
+                }
+            }
+            launch {
+                handoff.ownership.collectLatest { ownership ->
+                    textOwnership.text = getString(R.string.status_ownership_format, ownership.name)
                 }
             }
             launch {
