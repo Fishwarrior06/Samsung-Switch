@@ -8,6 +8,8 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import android.os.IBinder
 import com.samsungswitch.ble.AppLogger
 import kotlinx.coroutines.Dispatchers
@@ -34,6 +36,10 @@ class ShizukuA2dpConnector(
         context.getSystemService(BluetoothManager::class.java)?.adapter
     }
 
+    private val audioManager: AudioManager? by lazy {
+        context.getSystemService(AudioManager::class.java)
+    }
+
     @Volatile
     private var boundService: IA2dpControlService? = null
 
@@ -48,16 +54,40 @@ class ShizukuA2dpConnector(
 
     override fun isBudsConnected(): Boolean {
         val adapter = bluetoothAdapter ?: return false
-        val device = findTargetBudsDevice(adapter) ?: return false
-        return try {
-            val isConnectedMethod = BluetoothDevice::class.java.getMethod("isConnected")
-            (isConnectedMethod.invoke(device) as? Boolean) ?: false
-        } catch (_: Throwable) {
-            false
+        val targetDevice = findTargetBudsDevice(adapter) ?: return false
+        val targetAddress = targetDevice.address
+        val outputs = audioManager?.getDevices(AudioManager.GET_DEVICES_OUTPUTS).orEmpty()
+        val connected = outputs.any { info ->
+            val isBtAudio = info.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                info.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                info.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+            if (!isBtAudio) return@any false
+            val addrMatch = !targetAddress.isNullOrBlank() &&
+                info.address.equals(targetAddress, ignoreCase = true)
+            val nameMatch = info.productName?.toString()?.contains("buds", ignoreCase = true) == true
+            addrMatch || nameMatch
         }
+        AppLogger.d(CATEGORY, "Buds audio output connected=$connected")
+        return connected
     }
 
-    override suspend fun connectBuds(): Boolean = withContext(Dispatchers.IO) {
+    override fun getBudsDisplayName(): String? {
+        val adapter = bluetoothAdapter ?: return null
+        return findTargetBudsDevice(adapter)?.name
+    }
+
+    override suspend fun connectBuds(): Boolean = invokeUserServiceAction("connectA2dp") { service, device ->
+        service.connectA2dp(device)
+    }
+
+    override suspend fun disconnectBuds(): Boolean = invokeUserServiceAction("disconnectA2dp") { service, device ->
+        service.disconnectA2dp(device)
+    }
+
+    private suspend fun invokeUserServiceAction(
+        actionName: String,
+        action: (IA2dpControlService, BluetoothDevice) -> Boolean
+    ): Boolean = withContext(Dispatchers.IO) {
         if (!isReady()) {
             AppLogger.w(CATEGORY, "Shizuku binder not ready or permission not granted")
             return@withContext false
@@ -76,11 +106,11 @@ class ShizukuA2dpConnector(
         }
 
         return@withContext try {
-            val result = service.connectA2dp(budsDevice)
-            AppLogger.i(CATEGORY, "Shizuku A2dpUserService.connectA2dp() returned $result")
+            val result = action(service, budsDevice)
+            AppLogger.i(CATEGORY, "Shizuku A2dpUserService.$actionName() returned $result")
             result
         } catch (e: Throwable) {
-            AppLogger.e(CATEGORY, "Remote call to A2dpUserService failed", e)
+            AppLogger.e(CATEGORY, "Remote call to A2dpUserService.$actionName failed", e)
             boundService = null
             false
         }
@@ -127,7 +157,7 @@ class ShizukuA2dpConnector(
             .daemon(false)
             .processNameSuffix("a2dp")
             .debuggable(false)
-            .version(6)
+            .version(7)
             .tag(SERVICE_TAG)
 
         return withTimeoutOrNull(BIND_TIMEOUT_MS) {

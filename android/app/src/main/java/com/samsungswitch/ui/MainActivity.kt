@@ -19,6 +19,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
 import android.widget.Button
+import android.widget.Switch
 import android.widget.TextView
 import com.samsungswitch.R
 import com.samsungswitch.ble.AppLogger
@@ -56,6 +57,7 @@ class MainActivity : Activity() {
     private lateinit var textOwnership: TextView
     private lateinit var textLastRx: TextView
     private lateinit var textLastTx: TextView
+    private lateinit var switchAutoSwitch: Switch
 
     private val shizukuPermissionListener =
         Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
@@ -80,8 +82,13 @@ class MainActivity : Activity() {
         textOwnership = findViewById(R.id.textOwnership)
         textLastRx = findViewById(R.id.textLastRx)
         textLastTx = findViewById(R.id.textLastTx)
+        switchAutoSwitch = findViewById(R.id.switchAutoSwitch)
         Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
         refreshShizukuStatus()
+
+        switchAutoSwitch.setOnCheckedChangeListener { _, isChecked ->
+            BleLinkManager.handoffCoordinator.setAutoSwitchEnabled(isChecked)
+        }
 
         findViewById<Button>(R.id.btnPairMac).setOnClickListener {
             if (ensureBluetoothConnectPermission()) {
@@ -133,8 +140,13 @@ class MainActivity : Activity() {
 
         startObservingStateFlows()
         if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
-            BleLinkManager.connectSavedDevice(autoConnect = false)
+            BleLinkManager.connectSavedDevice(autoConnect = true)
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshShizukuStatus()
     }
 
     override fun onDestroy() {
@@ -193,6 +205,13 @@ class MainActivity : Activity() {
                 }
             }
             launch {
+                handoff.autoSwitchEnabled.collectLatest { enabled ->
+                    if (switchAutoSwitch.isChecked != enabled) {
+                        switchAutoSwitch.isChecked = enabled
+                    }
+                }
+            }
+            launch {
                 coordinator.lastRxSummary.collectLatest { rx ->
                     textLastRx.text = rx
                 }
@@ -238,6 +257,7 @@ class MainActivity : Activity() {
     }
 
     private fun startCompanionAssociation() {
+        cleanupExistingCompanionAssociations()
         associationHandledForCurrentAttempt = false
         BleLinkManager.coordinator.updateLinkState(BleLinkState.Associating)
         val scanFilter = ScanFilter.Builder()
@@ -291,6 +311,28 @@ class MainActivity : Activity() {
         } else {
             @Suppress("DEPRECATION")
             companionDeviceManager.associate(request, callback, Handler(Looper.getMainLooper()))
+        }
+    }
+
+    private fun cleanupExistingCompanionAssociations() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            try {
+                for (association in companionDeviceManager.myAssociations) {
+                    companionDeviceManager.disassociate(association.id)
+                }
+            } catch (e: Throwable) {
+                AppLogger.w(CATEGORY, "Failed clearing stale companion associations")
+            }
+        } else {
+            try {
+                @Suppress("DEPRECATION")
+                for (address in companionDeviceManager.associations) {
+                    @Suppress("DEPRECATION")
+                    companionDeviceManager.disassociate(address)
+                }
+            } catch (e: Throwable) {
+                AppLogger.w(CATEGORY, "Failed clearing legacy companion associations")
+            }
         }
     }
 
@@ -356,6 +398,6 @@ class MainActivity : Activity() {
         } catch (e: SecurityException) {
             AppLogger.w(CATEGORY, "Unable to start device presence observation")
         }
-        BleLinkManager.connect(address, autoConnect = false)
+        BleLinkManager.connect(address, autoConnect = true)
     }
 }

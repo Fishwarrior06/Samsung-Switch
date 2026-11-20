@@ -9,6 +9,11 @@ public enum HandoffOwnership: String, Sendable, Equatable {
     case handingOffToPhone
 }
 
+public enum HandoffDestination: String, Sendable, Equatable {
+    case mac
+    case phone
+}
+
 @MainActor
 public protocol BudsControlling: AnyObject {
     var budsDisplayName: String? { get }
@@ -38,21 +43,27 @@ public final class HandoffStateMachine {
 
     public var onStateChanged: (() -> Void)?
     public var onFrameTransmitted: ((HandoffFrame) -> Void)?
+    public var onHandoffCompleted: ((HandoffDestination, HandoffReason) -> Void)?
 
     private let bleTransport: BLETransport
     private let budsController: BudsControlling
     private let mediaPauser: MediaPausing
     private let mediaDebounce: Duration
     private let cooldownDuration: Duration
+    private let peerReleaseWaitTimeout: Duration
     private let nowProvider: () -> ContinuousClock.Instant
 
     private var sequenceNumber: UInt16 = 0
     private var isLocalAudioPlaying = false
     private var lastHandoffCompletedAt: ContinuousClock.Instant?
+    private var lastBudsDisconnectedAt: ContinuousClock.Instant?
     private var lastFailedPullAt: ContinuousClock.Instant?
     private var phoneReportedBudsConnected = false
     private var phoneState: PeerState = .idle
     private var debounceTask: Task<Void, Never>?
+    private var activeTransitionTask: Task<Void, Never>?
+    private var transitionGeneration: UInt64 = 0
+    private var pendingPeerReleaseContinuation: CheckedContinuation<Void, Never>?
 
     public init(
         bleTransport: BLETransport,
@@ -60,6 +71,7 @@ public final class HandoffStateMachine {
         mediaPauser: MediaPausing,
         mediaDebounce: Duration = .milliseconds(400),
         cooldownDuration: Duration = .milliseconds(2500),
+        peerReleaseWaitTimeout: Duration = .milliseconds(600),
         nowProvider: @escaping () -> ContinuousClock.Instant = { ContinuousClock.now }
     ) {
         self.bleTransport = bleTransport
@@ -67,6 +79,7 @@ public final class HandoffStateMachine {
         self.mediaPauser = mediaPauser
         self.mediaDebounce = mediaDebounce
         self.cooldownDuration = cooldownDuration
+        self.peerReleaseWaitTimeout = peerReleaseWaitTimeout
         self.nowProvider = nowProvider
     }
 
@@ -75,6 +88,59 @@ public final class HandoffStateMachine {
         if !enabled {
             cancelPendingDebounce()
         }
+    }
+
+    public func syncInitialBudsConnection(connectedToMac: Bool) {
+        ownership = connectedToMac ? .macActive : .idle
+    }
+
+    public func handleBudsOutputChanged(connectedToMac: Bool) {
+        if connectedToMac {
+            if ownership != .macActive &&
+                ownership != .handingOffToMac &&
+                ownership != .handingOffToPhone {
+                ownership = .macActive
+                transmit(opcode: .stateSync, reason: .manual, state: .budsConnected)
+                onHandoffCompleted?(.mac, .manual)
+            }
+        } else {
+            cancelPendingDebounce()
+            lastBudsDisconnectedAt = nowProvider()
+            if ownership == .macActive {
+                ownership = .idle
+                transmit(opcode: .stateSync, reason: .none, state: .idle)
+            }
+        }
+    }
+
+    public func handleMacDidWake() {
+        guard ownership != .handingOffToMac && ownership != .handingOffToPhone else { return }
+        if budsController.isBudsConnectedToMac {
+            if ownership != .macActive {
+                ownership = .macActive
+                transmit(opcode: .stateSync, reason: .none, state: .budsConnected)
+            }
+        } else if ownership == .macActive {
+            ownership = .idle
+            transmit(opcode: .stateSync, reason: .none, state: .idle)
+        }
+    }
+
+    public func handlePeerConnected() {
+        guard ownership != .handingOffToMac && ownership != .handingOffToPhone else { return }
+        if budsController.isBudsConnectedToMac {
+            ownership = .macActive
+            transmit(opcode: .stateSync, reason: .none, state: .budsConnected)
+        } else {
+            if ownership == .macActive {
+                ownership = .idle
+            }
+            transmit(opcode: .stateSync, reason: .none, state: .idle)
+        }
+    }
+
+    public func handleLocalAudioActivityDetected() {
+        handleLocalAudioChanged(isPlaying: true)
     }
 
     public func handleLocalAudioChanged(isPlaying: Bool) {
@@ -92,13 +158,17 @@ public final class HandoffStateMachine {
             logger.info("Ignoring Mac audio start while phone is in call (CALL_LOCK)")
             return
         }
+        guard case .connected = bleTransport.status else {
+            logger.debug("Ignoring auto Mac audio pull: phone BLE link not connected")
+            return
+        }
         guard ownership != .macActive && ownership != .handingOffToMac else { return }
-        guard !isInCooldown() else {
-            logger.debug("Ignoring Mac audio start during post-handoff cooldown")
+        guard !isInCooldown() && !isInPostDisconnectGrace() else {
+            logger.debug("Ignoring Mac audio bounce during post-handoff/disconnect cooldown")
             return
         }
 
-        scheduleMacMediaClaim()
+        scheduleMacMediaClaim(after: mediaDebounce)
     }
 
     public func handleRemoteFrame(_ frame: HandoffFrame) {
@@ -106,9 +176,13 @@ public final class HandoffStateMachine {
         case .claim:
             handleRemoteClaim(frame)
         case .released:
-            if ownership == .handingOffToPhone {
-                ownership = .phoneActive
-                lastHandoffCompletedAt = nowProvider()
+            if ownership == .handingOffToMac {
+                resumePendingPeerRelease()
+            } else {
+                phoneReportedBudsConnected = false
+                if ownership == .phoneActive {
+                    ownership = budsController.isBudsConnectedToMac ? .macActive : .idle
+                }
             }
         case .stateSync:
             phoneState = frame.state
@@ -116,6 +190,18 @@ public final class HandoffStateMachine {
             isPhoneInCall = (frame.state == .inCall)
             if isPhoneInCall {
                 cancelPendingDebounce()
+            }
+            if ownership != .handingOffToMac && ownership != .handingOffToPhone {
+                if budsController.isBudsConnectedToMac {
+                    if ownership != .macActive {
+                        ownership = .macActive
+                        transmit(opcode: .stateSync, reason: .none, state: .budsConnected)
+                    }
+                } else if frame.state == .budsConnected || frame.state == .inCall {
+                    ownership = .phoneActive
+                } else if frame.state == .idle && ownership == .phoneActive {
+                    ownership = .idle
+                }
             }
         case .heartbeatAck:
             break
@@ -127,23 +213,39 @@ public final class HandoffStateMachine {
             logger.info("Blocked manual pull during active phone call")
             return
         }
-        cancelPendingDebounce()
-        Task { await executePullToMac(reason: .manual) }
+        startTransition { machine, generation in
+            await machine.executePullToMac(reason: .manual, generation: generation)
+        }
     }
 
     public func handleManualRelease() {
-        cancelPendingDebounce()
-        Task { await executeReleaseToPhone(reason: .manual) }
+        startTransition { machine, generation in
+            await machine.executeReleaseToPhone(reason: .manual, generation: generation)
+        }
     }
 
     public func handleMacWillSleep() {
         cancelPendingDebounce()
         if ownership == .macActive || ownership == .handingOffToMac || budsController.isBudsConnectedToMac {
-            Task { await executeReleaseToPhone(reason: .none) }
+            startTransition { machine, generation in
+                await machine.executeReleaseToPhone(reason: .none, generation: generation)
+            }
         }
     }
 
     // MARK: - Private Transitions
+
+    private func startTransition(_ body: @escaping @MainActor (HandoffStateMachine, UInt64) async -> Void) {
+        cancelPendingDebounce()
+        resumePendingPeerRelease()
+        activeTransitionTask?.cancel()
+        transitionGeneration &+= 1
+        let generation = transitionGeneration
+        activeTransitionTask = Task { [weak self] in
+            guard let self else { return }
+            await body(self, generation)
+        }
+    }
 
     private func handleRemoteClaim(_ frame: HandoffFrame) {
         if frame.reason == .call || frame.state == .inCall {
@@ -153,7 +255,9 @@ public final class HandoffStateMachine {
             phoneReportedBudsConnected = true
             cancelPendingDebounce()
             mediaPauser.pauseLocalMediaIfPlaying(isPlaying: isLocalAudioPlaying)
-            Task { await executeReleaseToPhone(reason: .call) }
+            startTransition { machine, generation in
+                await machine.executeReleaseToPhone(reason: .call, generation: generation)
+            }
             return
         }
 
@@ -169,30 +273,42 @@ public final class HandoffStateMachine {
 
         cancelPendingDebounce()
         mediaPauser.pauseLocalMediaIfPlaying(isPlaying: isLocalAudioPlaying)
-        Task { await executeReleaseToPhone(reason: .media) }
+        startTransition { machine, generation in
+            await machine.executeReleaseToPhone(reason: .media, generation: generation)
+        }
     }
 
-    private func scheduleMacMediaClaim() {
+    private func scheduleMacMediaClaim(after delay: Duration) {
         cancelPendingDebounce()
         debounceTask = Task { [weak self] in
             guard let self else { return }
             do {
-                try await Task.sleep(for: self.mediaDebounce)
+                try await Task.sleep(for: delay)
             } catch {
                 return
             }
             guard !Task.isCancelled else { return }
+            self.debounceTask = nil
             guard self.isLocalAudioPlaying,
                   self.isAutoSwitchEnabled,
                   !self.isPhoneInCall,
                   !self.isInCooldown() else {
                 return
             }
-            await self.executePullToMac(reason: .media)
+            self.startTransition { machine, generation in
+                await machine.executePullToMac(reason: .media, generation: generation)
+            }
         }
     }
 
-    private func executePullToMac(reason: HandoffReason) async {
+    private func executePullToMac(reason: HandoffReason, generation: UInt64) async {
+        defer {
+            if generation == transitionGeneration {
+                activeTransitionTask = nil
+            }
+        }
+        guard !Task.isCancelled && generation == transitionGeneration else { return }
+
         // Guard: if a recent auto openConnection() failed (e.g. Buds in case), avoid spamming retries.
         if reason == .media,
            let lastFailedPullAt,
@@ -204,25 +320,79 @@ public final class HandoffStateMachine {
         ownership = .handingOffToMac
         transmit(opcode: .claim, reason: reason, state: isLocalAudioPlaying ? .playing : .idle)
 
+        if case .connected = bleTransport.status, peerReleaseWaitTimeout > .zero {
+            await waitForPeerReleaseOrTimeout()
+        }
+        guard !Task.isCancelled && generation == transitionGeneration else { return }
+
         let success = await budsController.pullBuds()
+        guard !Task.isCancelled && generation == transitionGeneration else { return }
+
         if success {
             lastFailedPullAt = nil
             ownership = .macActive
             lastHandoffCompletedAt = nowProvider()
-            transmit(opcode: .stateSync, reason: .none, state: .budsConnected)
+            transmit(opcode: .stateSync, reason: reason, state: .budsConnected)
+            onHandoffCompleted?(.mac, reason)
         } else {
             lastFailedPullAt = nowProvider()
-            ownership = phoneReportedBudsConnected ? .phoneActive : .idle
+            if budsController.isBudsConnectedToMac {
+                ownership = .macActive
+                transmit(opcode: .stateSync, reason: .none, state: .budsConnected)
+            } else {
+                ownership = phoneReportedBudsConnected ? .phoneActive : .idle
+                transmit(opcode: .stateSync, reason: .none, state: .idle)
+            }
+        }
+    }
+
+    private func executeReleaseToPhone(reason: HandoffReason, generation: UInt64) async {
+        defer {
+            if generation == transitionGeneration {
+                activeTransitionTask = nil
+            }
+        }
+        guard !Task.isCancelled && generation == transitionGeneration else { return }
+
+        cancelPendingDebounce()
+        ownership = .handingOffToPhone
+        let released = await budsController.releaseBuds()
+        guard !Task.isCancelled && generation == transitionGeneration else { return }
+
+        if released {
+            ownership = .phoneActive
+            let now = nowProvider()
+            lastHandoffCompletedAt = now
+            lastBudsDisconnectedAt = now
+            transmit(opcode: .released, reason: reason, state: .idle)
+            onHandoffCompleted?(.phone, reason)
+        } else if budsController.isBudsConnectedToMac {
+            logger.warning("Failed to release Buds; Buds remain connected to Mac")
+            ownership = .macActive
+            transmit(opcode: .stateSync, reason: .none, state: .budsConnected)
+        } else {
+            ownership = .idle
             transmit(opcode: .stateSync, reason: .none, state: .idle)
         }
     }
 
-    private func executeReleaseToPhone(reason: HandoffReason) async {
-        ownership = .handingOffToPhone
-        _ = await budsController.releaseBuds()
-        ownership = .phoneActive
-        lastHandoffCompletedAt = nowProvider()
-        transmit(opcode: .released, reason: reason, state: .idle)
+    private func waitForPeerReleaseOrTimeout() async {
+        guard !Task.isCancelled else { return }
+        let timeout = peerReleaseWaitTimeout
+        let timeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: timeout)
+            self?.resumePendingPeerRelease()
+        }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            pendingPeerReleaseContinuation = continuation
+        }
+        timeoutTask.cancel()
+    }
+
+    private func resumePendingPeerRelease() {
+        guard let continuation = pendingPeerReleaseContinuation else { return }
+        pendingPeerReleaseContinuation = nil
+        continuation.resume()
     }
 
     private func transmit(opcode: HandoffOpcode, reason: HandoffReason, state: PeerState) {
@@ -237,9 +407,19 @@ public final class HandoffStateMachine {
         onFrameTransmitted?(frame)
     }
 
+    private func remainingCooldown() -> Duration {
+        guard let lastHandoffCompletedAt else { return .zero }
+        let elapsed = nowProvider() - lastHandoffCompletedAt
+        return elapsed < cooldownDuration ? (cooldownDuration - elapsed) : .zero
+    }
+
     private func isInCooldown() -> Bool {
-        guard let lastHandoffCompletedAt else { return false }
-        return (nowProvider() - lastHandoffCompletedAt) < cooldownDuration
+        remainingCooldown() > .zero
+    }
+
+    private func isInPostDisconnectGrace() -> Bool {
+        guard let lastBudsDisconnectedAt else { return false }
+        return (nowProvider() - lastBudsDisconnectedAt) < cooldownDuration
     }
 
     private func cancelPendingDebounce() {

@@ -7,6 +7,9 @@ public final class IOBluetoothBudsController: BudsControlling {
     private let logger = Logger(subsystem: "com.samsungswitch.macos", category: "IOBluetoothBuds")
     private let audioMonitor: CoreAudioMonitor
     private var isOperationInFlight = false
+    private var operationWaiters: [CheckedContinuation<Void, Never>] = []
+
+    private static let pageTimeoutSlots: BluetoothHCIPageTimeout = 9600 // 9600 * 0.625 ms = 6.0 s
 
     public init(audioMonitor: CoreAudioMonitor) {
         self.audioMonitor = audioMonitor
@@ -26,8 +29,11 @@ public final class IOBluetoothBudsController: BudsControlling {
     }
 
     public func pullBuds() async -> Bool {
-        guard !isOperationInFlight else {
-            logger.debug("Ignoring pullBuds(): Bluetooth operation already in flight")
+        await acquireOperationTurn()
+        defer { releaseOperationTurn() }
+
+        guard !Task.isCancelled else {
+            logger.debug("Cancelled pullBuds() before opening connection")
             return false
         }
         guard let address = findTargetBudsDevice()?.addressString else {
@@ -35,39 +41,46 @@ public final class IOBluetoothBudsController: BudsControlling {
             return false
         }
 
-        isOperationInFlight = true
-        defer { isOperationInFlight = false }
-
-        let status = await Task.detached(priority: .userInitiated) {
-            guard let device = IOBluetoothDevice(addressString: address) else {
-                return kIOReturnNoDevice
-            }
-            return device.openConnection()
-        }.value
-
-        if status == kIOReturnSuccess {
+        let firstStatus = await attemptOpenConnection(address: address)
+        if firstStatus == kIOReturnSuccess || isBudsConnectedToMac {
             logger.info("IOBluetoothDevice.openConnection() succeeded")
             return true
         }
-        logger.warning("IOBluetoothDevice.openConnection() returned \(status)")
-        return isBudsConnectedToMac
+
+        guard !Task.isCancelled else {
+            logger.debug("Cancelled pullBuds() before retry")
+            return false
+        }
+
+        logger.warning("First openConnection() attempt returned \(firstStatus); retrying after 300 ms")
+        try? await Task.sleep(for: .milliseconds(300))
+
+        guard !Task.isCancelled else {
+            logger.debug("Cancelled pullBuds() after retry backoff")
+            return false
+        }
+
+        let retryStatus = await attemptOpenConnection(address: address)
+        if retryStatus == kIOReturnSuccess || isBudsConnectedToMac {
+            logger.info("IOBluetoothDevice.openConnection() retry succeeded")
+            return true
+        }
+
+        logger.error("IOBluetoothDevice.openConnection() failed after retry: \(retryStatus)")
+        return false
     }
 
     public func releaseBuds() async -> Bool {
-        guard !isOperationInFlight else {
-            logger.debug("Ignoring releaseBuds(): Bluetooth operation already in flight")
-            return false
-        }
+        await acquireOperationTurn()
+        defer { releaseOperationTurn() }
+
         guard let device = findTargetBudsDevice(), let address = device.addressString else {
-            return false
+            return !isBudsConnectedToMac
         }
         guard isBudsConnectedToMac || device.isConnected() else {
             logger.debug("Skipping closeConnection(): Buds are not connected to Mac")
             return true
         }
-
-        isOperationInFlight = true
-        defer { isOperationInFlight = false }
 
         let status = await Task.detached(priority: .userInitiated) {
             guard let target = IOBluetoothDevice(addressString: address) else {
@@ -77,22 +90,53 @@ public final class IOBluetoothBudsController: BudsControlling {
         }.value
 
         logger.info("IOBluetoothDevice.closeConnection() returned \(status)")
-        return status == kIOReturnSuccess
+        return status == kIOReturnSuccess || !isBudsConnectedToMac
+    }
+
+    private func acquireOperationTurn() async {
+        if !isOperationInFlight {
+            isOperationInFlight = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            operationWaiters.append(continuation)
+        }
+    }
+
+    private func releaseOperationTurn() {
+        if operationWaiters.isEmpty {
+            isOperationInFlight = false
+        } else {
+            let next = operationWaiters.removeFirst()
+            next.resume()
+        }
+    }
+
+    private func attemptOpenConnection(address: String) async -> IOReturn {
+        let timeout = Self.pageTimeoutSlots
+        return await Task.detached(priority: .userInitiated) {
+            guard let device = IOBluetoothDevice(addressString: address) else {
+                return kIOReturnNoDevice
+            }
+            return device.openConnection(nil, withPageTimeout: timeout, authenticationRequired: false)
+        }.value
     }
 
     private func findTargetBudsDevice() -> IOBluetoothDevice? {
         let paired = (IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice]) ?? []
         var seen = Set<String>()
+        var unique: [IOBluetoothDevice] = []
         for device in paired {
             let addr = (device.addressString ?? "").lowercased()
             if !addr.isEmpty && !seen.insert(addr).inserted {
                 continue
             }
-            let name = (device.name ?? "").lowercased()
-            if name.contains("buds") || name.contains("galaxy") {
-                return device
-            }
+            unique.append(device)
         }
-        return nil
+
+        if let budsDevice = unique.first(where: { ($0.name ?? "").lowercased().contains("buds") }) {
+            return budsDevice
+        }
+        return unique.first(where: { ($0.name ?? "").lowercased().contains("galaxy") })
     }
 }

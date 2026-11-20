@@ -28,6 +28,18 @@ class A2dpUserService(
     }
 
     override fun connectA2dp(device: BluetoothDevice): Boolean {
+        return withIBluetooth { bluetooth ->
+            invokeProfileMethod(bluetooth, "connectAllEnabledProfiles", device)
+        }
+    }
+
+    override fun disconnectA2dp(device: BluetoothDevice): Boolean {
+        return withIBluetooth { bluetooth ->
+            invokeProfileMethod(bluetooth, "disconnectAllEnabledProfiles", device)
+        }
+    }
+
+    private fun withIBluetooth(block: (Any) -> Boolean): Boolean {
         val bmBinder = SystemServiceHelper.getSystemService("bluetooth_manager")
         if (bmBinder == null) {
             Log.w(TAG, "SystemServiceHelper.getSystemService(bluetooth_manager) returned null")
@@ -40,9 +52,9 @@ class A2dpUserService(
                 ?: return false
 
             val bluetoothAdapter = obtainIBluetooth(bm) ?: return false
-            invokeConnectProfiles(bluetoothAdapter, device)
+            block(bluetoothAdapter)
         } catch (e: Throwable) {
-            Log.e(TAG, "connectA2dp via IBluetoothManager failed", e)
+            Log.e(TAG, "withIBluetooth invocation failed", e)
             false
         }
     }
@@ -63,7 +75,6 @@ class A2dpUserService(
             val rawBinder = object : Binder() {
                 override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
                     if (code == FIRST_CALL_TRANSACTION) {
-                        // onBluetoothServiceUp(IBluetooth bluetoothService)
                         data.enforceInterface(DESCRIPTOR_BM_CALLBACK)
                         val btBinder = data.readStrongBinder()
                         if (btBinder != null) {
@@ -82,7 +93,6 @@ class A2dpUserService(
             val callbackProxy = asInterface.invoke(null, rawBinder)
 
             val ret = registerMethod.invoke(bm, callbackProxy)
-            Log.i(TAG, "registerAdapter returned: ${ret?.javaClass?.name} ($ret)")
             if (ret is IBinder) {
                 val btStub = Class.forName("android.bluetooth.IBluetooth\$Stub")
                 return btStub.getMethod("asInterface", IBinder::class.java).invoke(null, ret)
@@ -100,26 +110,21 @@ class A2dpUserService(
         return null
     }
 
-    private fun invokeConnectProfiles(bluetooth: Any, device: BluetoothDevice): Boolean {
+    private fun invokeProfileMethod(
+        bluetooth: Any,
+        methodName: String,
+        device: BluetoothDevice
+    ): Boolean {
         val attributionSource = AttributionSource.Builder(Process.myUid())
             .setPackageName("com.android.shell")
             .build()
 
-        val connectMethods = bluetooth.javaClass.methods.filter {
-            it.name == "connectAllEnabledProfiles"
-        }
-        Log.i(
-            TAG,
-            "IBluetooth(${bluetooth.javaClass.name}).connectAllEnabledProfiles: ${
-                connectMethods.map { m -> m.parameterTypes.map { it.simpleName } }
-            }"
-        )
-
-        for (method in connectMethods) {
+        val overloads = bluetooth.javaClass.methods.filter { it.name == methodName }
+        for (method in overloads) {
             val params = method.parameterTypes
             if (params.size == 2 && params[0] == BluetoothDevice::class.java) {
                 val res = method.invoke(bluetooth, device, attributionSource)
-                Log.i(TAG, "Invoked connectAllEnabledProfiles(device, attr) -> $res")
+                Log.i(TAG, "Invoked $methodName(device, attr) -> $res")
                 return when (res) {
                     is Int -> res == 0
                     is Boolean -> res
@@ -129,18 +134,12 @@ class A2dpUserService(
             if (params.size == 3 && params[0] == BluetoothDevice::class.java) {
                 val receiver = params[2].getDeclaredConstructor().newInstance()
                 method.invoke(bluetooth, device, attributionSource, receiver)
-                Log.i(TAG, "Invoked connectAllEnabledProfiles(device, attr, receiver)")
+                Log.i(TAG, "Invoked $methodName(device, attr, receiver)")
                 return true
             }
         }
 
-        Log.w(
-            TAG,
-            "IBluetooth connect methods: ${
-                bluetooth.javaClass.methods.filter { it.name.contains("connect", ignoreCase = true) }
-                    .map { it.name }
-            }"
-        )
+        Log.w(TAG, "No compatible overload for $methodName found")
         return false
     }
 

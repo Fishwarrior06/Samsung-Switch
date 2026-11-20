@@ -51,7 +51,7 @@ Frames with `length != 6`, `version != 0x01`, or unknown enum values must be rej
 | Value | Name | Direction | Meaning |
 |---|---|---|---|
 | `0x01` | `CLAIM` | Bidirectional | Sender claims Buds ownership (Mac or Phone audio/call started) |
-| `0x02` | `RELEASED` | Mac → Android | Mac closed the Buds connection (`closeConnection()` completed) |
+| `0x02` | `RELEASED` | Bidirectional | Sender closed/disconnected Buds profiles (Mac `closeConnection` or Android Shizuku `disconnectAllEnabledProfiles`) |
 | `0x03` | `STATE_SYNC` | Bidirectional | Initial/periodic state synchronization upon connect or state change |
 | `0x04` | `HEARTBEAT_ACK` | Bidirectional | Link verification / acknowledgment echoing peer `seq` |
 

@@ -4,12 +4,13 @@ import os
 import SamsungSwitchCore
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let logger = Logger(subsystem: "com.samsungswitch.macos", category: "App")
     private let bleServer = BLEGattServer()
     private let audioMonitor = CoreAudioMonitor()
     private lazy var budsController = IOBluetoothBudsController(audioMonitor: audioMonitor)
     private let mediaPauser = MacMediaPauser()
+    private let diagnosticBuffer = DiagnosticLogBuffer()
     private lazy var stateMachine = HandoffStateMachine(
         bleTransport: bleServer,
         budsController: budsController,
@@ -31,9 +32,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItem()
         setupSleepWakeObservers()
-        wireComponents()
-        bleServer.start()
         audioMonitor.start()
+        wireComponents()
+        stateMachine.syncInitialBudsConnection(connectedToMac: audioMonitor.isBudsActiveOutput())
+        bleServer.start()
+        diagnosticBuffer.append("Launched macOS menu-bar agent")
         logger.info("Samsung Switch macOS menu-bar service launched")
     }
 
@@ -47,6 +50,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         audioMonitor.stop()
         bleServer.stop()
+    }
+
+    nonisolated func menuWillOpen(_ menu: NSMenu) {
+        MainActor.assumeIsolated {
+            refreshAccessibilityMenuItem()
+        }
     }
 
     private func setupStatusItem() {
@@ -65,6 +74,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let menu = NSMenu()
+        menu.delegate = self
         [statusMenuItem, ownershipMenuItem, audioMenuItem, lastRxMenuItem, lastTxMenuItem].forEach {
             $0.isEnabled = false
             menu.addItem($0)
@@ -97,20 +107,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         releaseItem.target = self
         menu.addItem(releaseItem)
 
-        let accessibilityTitle = mediaPauser.isAccessibilityAuthorized
-            ? "Mac Auto-Pause: Authorized"
-            : "Enable Mac Auto-Pause (Accessibility)..."
         let accessibilityItem = NSMenuItem(
-            title: accessibilityTitle,
+            title: "Enable Mac Auto-Pause (Accessibility)...",
             action: #selector(requestAccessibilityAction),
             keyEquivalent: ""
         )
         accessibilityItem.target = self
-        accessibilityItem.isEnabled = !mediaPauser.isAccessibilityAuthorized
         menu.addItem(accessibilityItem)
         accessibilityMenuItem = accessibilityItem
+        refreshAccessibilityMenuItem()
 
         menu.addItem(.separator())
+
+        let copyDiagItem = NSMenuItem(
+            title: "Copy Diagnostic Summary",
+            action: #selector(copyDiagnosticSummaryAction),
+            keyEquivalent: ""
+        )
+        copyDiagItem.target = self
+        menu.addItem(copyDiagItem)
 
         let restartItem = NSMenuItem(
             title: "Restart BLE Advertising",
@@ -140,6 +155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
+                self?.diagnosticBuffer.append("Mac sleeping: releasing Buds & pausing BLE")
                 self?.stateMachine.handleMacWillSleep()
                 self?.bleServer.pauseForSleep()
             }
@@ -150,6 +166,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
+                self?.diagnosticBuffer.append("Mac woke: reconciling Buds state & resuming BLE advertising")
+                self?.stateMachine.handleMacDidWake()
                 self?.bleServer.resumeAfterWake()
             }
         }
@@ -157,48 +175,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func wireComponents() {
         bleServer.onStatusChanged = { [weak self] status in
-            self?.statusMenuItem.title = "BLE: \(status.displayText)"
+            guard let self else { return }
+            self.statusMenuItem.title = "BLE: \(status.displayText)"
+            self.diagnosticBuffer.append("BLE -> \(status.displayText)")
+        }
+        bleServer.onPeerSubscribed = { [weak self] in
+            self?.stateMachine.handlePeerConnected()
         }
         bleServer.onFrameReceived = { [weak self] frame in
             guard let self else { return }
             self.lastRxMenuItem.title = "Last RX: \(frame.summary)"
+            self.diagnosticBuffer.append("RX: \(frame.summary)")
             self.stateMachine.handleRemoteFrame(frame)
         }
         audioMonitor.onRunningChanged = { [weak self] isPlaying in
+            self?.diagnosticBuffer.append("CoreAudio running -> \(isPlaying)")
             self?.stateMachine.handleLocalAudioChanged(isPlaying: isPlaying)
         }
+        audioMonitor.onPlaybackActivityDetected = { [weak self] in
+            self?.diagnosticBuffer.append("CoreAudio new audio output process detected")
+            self?.stateMachine.handleLocalAudioActivityDetected()
+        }
         audioMonitor.onOutputDeviceChanged = { [weak self] deviceName in
-            self?.audioMenuItem.title = "Output: \(deviceName)"
+            guard let self else { return }
+            self.audioMenuItem.title = "Output: \(deviceName)"
+            self.diagnosticBuffer.append("Output -> \(deviceName)")
+            self.stateMachine.handleBudsOutputChanged(
+                connectedToMac: self.audioMonitor.isBudsActiveOutput()
+            )
         }
         stateMachine.onStateChanged = { [weak self] in
             guard let self else { return }
             let callSuffix = self.stateMachine.isPhoneInCall ? " [CALL LOCK]" : ""
-            self.ownershipMenuItem.title = "State: \(self.stateMachine.ownership.rawValue)\(callSuffix)"
+            let stateText = "\(self.stateMachine.ownership.rawValue)\(callSuffix)"
+            self.ownershipMenuItem.title = "State: \(stateText)"
+            self.diagnosticBuffer.append("State -> \(stateText)")
         }
         stateMachine.onFrameTransmitted = { [weak self] frame in
             self?.lastTxMenuItem.title = "Last TX: \(frame.summary)"
+            self?.diagnosticBuffer.append("TX: \(frame.summary)")
+        }
+        stateMachine.onHandoffCompleted = { [weak self] destination, reason in
+            self?.diagnosticBuffer.append("Handoff completed -> \(destination.rawValue) (\(reason))")
         }
 
         statusMenuItem.title = "BLE: \(bleServer.status.displayText)"
         audioMenuItem.title = "Output: \(audioMonitor.defaultOutputDeviceName)"
     }
 
-    @objc private func toggleAutoSwitchAction() {
-        let next = !stateMachine.isAutoSwitchEnabled
-        stateMachine.setAutoSwitchEnabled(next)
-        autoSwitchMenuItem?.state = next ? .on : .off
-    }
-
-    @objc private func pullBudsAction() {
-        stateMachine.handleManualPull()
-    }
-
-    @objc private func releaseBudsAction() {
-        stateMachine.handleManualRelease()
-    }
-
-    @objc private func requestAccessibilityAction() {
-        mediaPauser.requestAccessibilityOptIn()
+    private func refreshAccessibilityMenuItem() {
         let authorized = mediaPauser.isAccessibilityAuthorized
         accessibilityMenuItem?.title = authorized
             ? "Mac Auto-Pause: Authorized"
@@ -206,7 +231,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         accessibilityMenuItem?.isEnabled = !authorized
     }
 
+    @objc private func toggleAutoSwitchAction() {
+        let next = !stateMachine.isAutoSwitchEnabled
+        stateMachine.setAutoSwitchEnabled(next)
+        autoSwitchMenuItem?.state = next ? .on : .off
+        diagnosticBuffer.append("Auto-Switch -> \(next)")
+    }
+
+    @objc private func pullBudsAction() {
+        diagnosticBuffer.append("Manual Pull requested")
+        stateMachine.handleManualPull()
+    }
+
+    @objc private func releaseBudsAction() {
+        diagnosticBuffer.append("Manual Release requested")
+        stateMachine.handleManualRelease()
+    }
+
+    @objc private func requestAccessibilityAction() {
+        mediaPauser.requestAccessibilityOptIn()
+        refreshAccessibilityMenuItem()
+    }
+
+    @objc private func copyDiagnosticSummaryAction() {
+        let callSuffix = stateMachine.isPhoneInCall ? " [CALL LOCK]" : ""
+        let report = diagnosticBuffer.formattedReport(
+            bleStatus: bleServer.status.displayText,
+            ownership: "\(stateMachine.ownership.rawValue)\(callSuffix)",
+            outputDevice: audioMonitor.defaultOutputDeviceName,
+            accessibilityAuthorized: mediaPauser.isAccessibilityAuthorized
+        )
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(report, forType: .string)
+    }
+
     @objc private func restartAdvertisingAction() {
+        diagnosticBuffer.append("Restarting BLE advertising")
         bleServer.restartAdvertising()
     }
 

@@ -37,7 +37,7 @@ class SamsungSwitchCompanionService : CompanionDeviceService() {
     override fun onDeviceDisappeared(associationInfo: AssociationInfo) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             AppLogger.i(CATEGORY, "Associated Mac disappeared (API 33+)")
-            BleLinkManager.disconnect()
+            BleLinkManager.onPeerDisappeared()
         }
     }
 
@@ -45,6 +45,6 @@ class SamsungSwitchCompanionService : CompanionDeviceService() {
     @Suppress("DEPRECATION")
     override fun onDeviceDisappeared(address: String) {
         AppLogger.i(CATEGORY, "Associated Mac disappeared (API 31-32)")
-        BleLinkManager.disconnect()
+        BleLinkManager.onPeerDisappeared()
     }
 }

@@ -22,7 +22,7 @@ public final class MacMediaPauser: MediaPausing {
     public func pauseLocalMediaIfPlaying(isPlaying: Bool) {
         guard isPlaying else { return }
         guard AXIsProcessTrusted() else {
-            logger.debug("Accessibility not granted; skipping synthetic media pause key")
+            logger.warning("Accessibility not granted; skipping synthetic media pause key")
             return
         }
         sendMediaPlayPauseKey()

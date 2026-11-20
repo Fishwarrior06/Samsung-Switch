@@ -38,6 +38,7 @@ public enum BLELinkStatus: Equatable, Sendable {
 public protocol BLETransport: AnyObject {
     var status: BLELinkStatus { get }
     var onStatusChanged: ((BLELinkStatus) -> Void)? { get set }
+    var onPeerSubscribed: (() -> Void)? { get set }
     var onFrameReceived: ((HandoffFrame) -> Void)? { get set }
 
     func start()
@@ -62,6 +63,7 @@ public final class BLEGattServer: NSObject, BLETransport {
     }
 
     public var onStatusChanged: ((BLELinkStatus) -> Void)?
+    public var onPeerSubscribed: (() -> Void)?
     public var onFrameReceived: ((HandoffFrame) -> Void)?
 
     private let serviceUUID = CBUUID(string: ProtocolConstants.serviceUUIDString)
@@ -180,6 +182,7 @@ public final class BLEGattServer: NSObject, BLETransport {
         case .poweredOff:
             serviceAdded = false
             subscribedCentralIDs.removeAll()
+            pendingOutboundFrames.removeAll()
             status = .bluetoothOff
         case .unauthorized:
             status = .unauthorized
@@ -330,9 +333,11 @@ extension BLEGattServer: CBPeripheralManagerDelegate {
             guard charUUIDString.caseInsensitiveCompare(ProtocolConstants.txToPhoneUUIDString) == .orderedSame else {
                 return
             }
+            pendingOutboundFrames.removeAll()
             subscribedCentralIDs.insert(centralID)
             updateConnectionStatus()
             logger.info("Phone subscribed to TX_TO_PHONE (subscribers=\(self.subscribedCentralIDs.count))")
+            onPeerSubscribed?()
         }
     }
 
@@ -348,6 +353,9 @@ extension BLEGattServer: CBPeripheralManagerDelegate {
                 return
             }
             subscribedCentralIDs.remove(centralID)
+            if subscribedCentralIDs.isEmpty {
+                pendingOutboundFrames.removeAll()
+            }
             updateConnectionStatus()
             logger.info("Phone unsubscribed from TX_TO_PHONE (subscribers=\(self.subscribedCentralIDs.count))")
         }

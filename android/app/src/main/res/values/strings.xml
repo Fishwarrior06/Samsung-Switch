@@ -10,6 +10,7 @@
     <string name="btn_send_claim">Send CLAIM (MEDIA)</string>
     <string name="btn_send_heartbeat">Send HEARTBEAT_ACK</string>
     <string name="btn_disconnect">Disconnect</string>
+    <string name="switch_auto_switch">Auto-Switch Enabled</string>
     <string name="status_ble_format">BLE Status: %1$s</string>
     <string name="status_shizuku_ready">Shizuku A2DP: Ready</string>
     <string name="status_shizuku_needed">Shizuku A2DP: Permission / Service needed</string>

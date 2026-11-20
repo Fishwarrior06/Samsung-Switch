@@ -25,13 +25,15 @@ import java.util.Locale
 @SuppressLint("MissingPermission")
 class BleGattClient(
     private val context: Context,
-    private val coordinator: BleLinkCoordinator
+    private val coordinator: BleLinkCoordinator,
+    private val initialPeerStateProvider: () -> PeerState = { PeerState.IDLE }
 ) : BleClientTransport {
 
     companion object {
         private const val CATEGORY = "BleGattClient"
         private const val GATT_INSUFFICIENT_AUTHENTICATION = 5
         private const val GATT_INSUFFICIENT_ENCRYPTION = 15
+        private const val MAX_OUTBOUND_QUEUE_SIZE = 8
     }
 
     private val bluetoothAdapter: BluetoothAdapter? by lazy {
@@ -39,7 +41,16 @@ class BleGattClient(
         manager?.adapter
     }
 
+    private val writeLock = Any()
+    private val outboundQueue = ArrayDeque<HandoffFrame>()
+    private var writeInFlight = false
+
     private var activeGatt: BluetoothGatt? = null
+    private var currentTargetAddress: String? = null
+    private var lastConnectedAddress: String? = null
+    private var connectionActiveOrPending = false
+    private var wasConnected = false
+    private var userInitiatedDisconnect = false
     private var txToMacChar: BluetoothGattCharacteristic? = null
     private var txToPhoneChar: BluetoothGattCharacteristic? = null
     private var pendingSubscribeAfterBond = false
@@ -98,6 +109,11 @@ class BleGattClient(
         }
 
         val normalizedAddress = address.uppercase(Locale.US)
+        if (activeGatt != null && currentTargetAddress == normalizedAddress && connectionActiveOrPending) {
+            AppLogger.d(CATEGORY, "Ignoring redundant GATT connect for active/pending link")
+            return
+        }
+
         val device = try {
             adapter.getRemoteDevice(normalizedAddress)
         } catch (e: IllegalArgumentException) {
@@ -108,6 +124,10 @@ class BleGattClient(
 
         closeCurrentGatt()
         registerBondReceiverIfNeeded()
+        userInitiatedDisconnect = false
+        currentTargetAddress = normalizedAddress
+        lastConnectedAddress = normalizedAddress
+        connectionActiveOrPending = true
         coordinator.updateLinkState(BleLinkState.Connecting)
         AppLogger.i(CATEGORY, "Connecting GATT (autoConnect=$autoConnect)")
 
@@ -120,12 +140,19 @@ class BleGattClient(
     }
 
     override fun disconnect() {
+        userInitiatedDisconnect = true
+        lastConnectedAddress = null
+        wasConnected = false
         pendingSubscribeAfterBond = false
         pendingWriteAfterBond = null
         closeCurrentGatt()
         unregisterBondReceiverIfNeeded()
         coordinator.updateLinkState(BleLinkState.Disconnected)
         AppLogger.i(CATEGORY, "GATT disconnected by client")
+    }
+
+    fun onPeerDisappeared() {
+        AppLogger.i(CATEGORY, "Peer disappeared callback; keeping passive autoConnect ready")
     }
 
     override fun sendFrame(frame: HandoffFrame): Boolean {
@@ -136,11 +163,25 @@ class BleGattClient(
             return false
         }
 
-        val payload = frame.encode()
-        val started = writeCharacteristicCompat(gatt, characteristic, payload)
+        synchronized(writeLock) {
+            if (writeInFlight) {
+                if (outboundQueue.size >= MAX_OUTBOUND_QUEUE_SIZE) {
+                    outboundQueue.removeFirst()
+                }
+                outboundQueue.addLast(frame)
+                AppLogger.d(CATEGORY, "Queued TX_TO_MAC (${outboundQueue.size}): ${frame.summary()}")
+                return true
+            }
+            writeInFlight = true
+        }
+
+        val started = writeCharacteristicCompat(gatt, characteristic, frame.encode())
         if (started) {
             AppLogger.d(CATEGORY, "Writing TX_TO_MAC: ${frame.summary()}")
         } else {
+            synchronized(writeLock) {
+                writeInFlight = false
+            }
             AppLogger.w(CATEGORY, "Failed to initiate characteristic write")
         }
         return started
@@ -149,15 +190,23 @@ class BleGattClient(
     private fun closeCurrentGatt() {
         txToMacChar = null
         txToPhoneChar = null
-        activeGatt?.let { gatt ->
+        connectionActiveOrPending = false
+        wasConnected = false
+        currentTargetAddress = null
+        synchronized(writeLock) {
+            outboundQueue.clear()
+            writeInFlight = false
+        }
+        val gatt = activeGatt
+        activeGatt = null
+        gatt?.let { client ->
             try {
-                gatt.disconnect()
-                gatt.close()
+                client.disconnect()
+                client.close()
             } catch (e: SecurityException) {
                 AppLogger.e(CATEGORY, "Missing permission while closing GATT", e)
             }
         }
-        activeGatt = null
     }
 
     private fun registerBondReceiverIfNeeded() {
@@ -207,6 +256,28 @@ class BleGattClient(
         AppLogger.d(CATEGORY, "Subscribing to TX_TO_PHONE notifications: started=$started")
     }
 
+    private fun flushNextQueuedWrite(gatt: BluetoothGatt) {
+        val characteristic = txToMacChar
+        val nextFrame: HandoffFrame? = synchronized(writeLock) {
+            if (characteristic != null && outboundQueue.isNotEmpty()) {
+                outboundQueue.removeFirst()
+            } else {
+                writeInFlight = false
+                null
+            }
+        }
+        if (nextFrame != null && characteristic != null) {
+            val started = writeCharacteristicCompat(gatt, characteristic, nextFrame.encode())
+            if (started) {
+                AppLogger.d(CATEGORY, "Flushed queued TX_TO_MAC: ${nextFrame.summary()}")
+            } else {
+                synchronized(writeLock) {
+                    writeInFlight = false
+                }
+            }
+        }
+    }
+
     @Suppress("DEPRECATION")
     private fun writeCharacteristicCompat(
         gatt: BluetoothGatt,
@@ -250,20 +321,41 @@ class BleGattClient(
 
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            if (gatt !== activeGatt) return
             if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
+                connectionActiveOrPending = true
+                wasConnected = true
                 AppLogger.i(CATEGORY, "GATT connected, discovering services")
                 gatt.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                val shouldAutoReconnect = !userInitiatedDisconnect &&
+                    wasConnected &&
+                    lastConnectedAddress != null &&
+                    bluetoothAdapter?.isEnabled == true
+                val reconnectAddress = lastConnectedAddress
                 txToMacChar = null
                 txToPhoneChar = null
+                connectionActiveOrPending = false
+                wasConnected = false
+                synchronized(writeLock) {
+                    outboundQueue.clear()
+                    writeInFlight = false
+                }
                 coordinator.updateLinkState(BleLinkState.Disconnected)
                 AppLogger.i(CATEGORY, "GATT disconnected (status=$status)")
+                if (shouldAutoReconnect && reconnectAddress != null) {
+                    AppLogger.i(CATEGORY, "Re-arming passive autoConnect GATT after disconnect (status=$status)")
+                    connect(reconnectAddress, autoConnect = true)
+                }
             } else if (status != BluetoothGatt.GATT_SUCCESS) {
+                connectionActiveOrPending = false
+                wasConnected = false
                 coordinator.updateLinkState(BleLinkState.Error("GATT status=$status"))
             }
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            if (gatt !== activeGatt) return
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 coordinator.updateLinkState(BleLinkState.Error("Service discovery failed ($status)"))
                 return
@@ -294,6 +386,7 @@ class BleGattClient(
             descriptor: BluetoothGattDescriptor,
             status: Int
         ) {
+            if (gatt !== activeGatt) return
             if (descriptor.uuid != ProtocolConstants.CCCD_UUID) return
 
             if (status == BluetoothGatt.GATT_SUCCESS) {
@@ -302,7 +395,7 @@ class BleGattClient(
                 coordinator.sendFrame(
                     opcode = HandoffOpcode.STATE_SYNC,
                     reason = HandoffReason.NONE,
-                    state = PeerState.IDLE
+                    state = initialPeerStateProvider()
                 )
             } else if (isAuthOrEncryptionError(status)) {
                 AppLogger.i(CATEGORY, "CCCD write requires BLE bonding (status=$status)")
@@ -318,15 +411,21 @@ class BleGattClient(
             characteristic: BluetoothGattCharacteristic,
             status: Int
         ) {
+            if (gatt !== activeGatt) return
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 AppLogger.d(CATEGORY, "TX_TO_MAC write acknowledged")
+                flushNextQueuedWrite(gatt)
             } else if (isAuthOrEncryptionError(status)) {
                 AppLogger.i(CATEGORY, "Write rejected for missing encryption; waiting/initiating bonding")
+                synchronized(writeLock) {
+                    writeInFlight = false
+                }
                 if (gatt.device.bondState == BluetoothDevice.BOND_NONE) {
                     initiateBondingIfNeeded(gatt.device)
                 }
             } else {
                 AppLogger.w(CATEGORY, "TX_TO_MAC write failed (status=$status)")
+                flushNextQueuedWrite(gatt)
             }
         }
 
@@ -335,6 +434,7 @@ class BleGattClient(
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
+            if (gatt !== activeGatt) return
             handleIncomingNotification(characteristic, value)
         }
 
@@ -344,6 +444,7 @@ class BleGattClient(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic
         ) {
+            if (gatt !== activeGatt) return
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
                 val value = characteristic.value ?: return
                 handleIncomingNotification(characteristic, value)
