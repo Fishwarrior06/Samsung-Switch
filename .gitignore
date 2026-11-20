@@ -1,0 +1,29 @@
+# Local documentation & test logs
+docs/
+
+# macOS / Swift / Xcode
+.DS_Store
+.build/
+.swiftpm/
+*.xcuserdata
+*.xcworkspace/xcuserdata/
+DerivedData/
+
+# Android / Gradle
+.gradle/
+local.properties
+*.apk
+*.aab
+*.ap_
+android/.idea/
+android/**/build/
+
+# Secrets / Signing / Personal configs (never commit!)
+*.jks
+*.keystore
+*.p12
+*.mobileprovision
+*.pem
+*.key
+.env
+.env.*
